@@ -4561,9 +4561,12 @@ def compute_atr(df, period=14):
     atr = atr.clip(lower=1e-8)
     return atr
 
-def compute_adx(df, period=14):
+def compute_adx(df, period=14, return_di=False):
     if df is None or not isinstance(df, pd.DataFrame) or len(df) < period*2:
-        return pd.Series([0.0]*len(df)) if df is not None and hasattr(df, '__len__') else pd.Series([0.0])
+        empty = pd.Series([0.0]*len(df)) if df is not None and hasattr(df, '__len__') else pd.Series([0.0])
+        if return_di:
+            return empty, empty, empty
+        return empty
     high = df['high']
     low = df['low']
     close = df['close']
@@ -4583,6 +4586,8 @@ def compute_adx(df, period=14):
     dx = (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)) * 100
     adx = rma(dx, period)
     adx = adx.bfill().ffill().fillna(0).clip(0, 100)
+    if return_di:
+        return adx, plus_di, minus_di
     return adx
 
 def compute_rsi(df, period=14):
@@ -11017,9 +11022,17 @@ class ExecutionCandidate:
             'news_event_type': self.news_event_type,
         }
 
+# Minimum OHLCV depth required by the TradingView evidence layer on the live
+# institutional path so EMA200 (>= 200 bars) and the HTF EMA200-slope proxy
+# (EMA200 needs a 21-bar window, so >= 210 bars) can actually fire. 260 leaves
+# warmup margin. If the exchange cannot supply this depth, the evidence engine
+# marks EMA200/HTF as explicitly unavailable (never silently "neutral").
+INSTITUTIONAL_OHLCV_DEPTH = 260
+
 class PreInstitutionalState(Enum):
     IDLE = "IDLE"
     WATCH = "WATCH"
+    INSTITUTIONAL_WATCH = "INSTITUTIONAL_WATCH"
     MONITORING = "MONITORING"
     BUILDING = "BUILDING"
     CONFIRMED = "CONFIRMED"
@@ -11073,6 +11086,15 @@ class InstitutionalRadar:
                 "IDLE": 0
             }
             priority += state_priority.get(state, 0)
+            # PRE_EXPANSION promotion: early institutional evidence => priority
+            # institutional analysis without waiting for STRONG.
+            pre_state = entry.get("pre_expansion_state")
+            pre_priorities = {
+                "PRE_EXPANSION_LONG": 30,
+                "PRE_EXPANSION_SHORT": 30,
+                "PRE_EXPANSION_CONFLICT": 15,
+            }
+            priority += pre_priorities.get(pre_state, 0)
             priorities[symbol] = min(100, priority)
         return priorities
 
@@ -11088,6 +11110,13 @@ class InstitutionalRadar:
             "IDLE": 90
         }
         interval = base_intervals.get(state, 60)
+        # PRE_EXPANSION promotion: re-analyze promoted candidates more often so
+        # the institutional machine can confirm / invalidate the hypothesis fast.
+        pre_state = entry.get("pre_expansion_state")
+        if pre_state == "PRE_EXPANSION_LONG" or pre_state == "PRE_EXPANSION_SHORT":
+            interval = min(interval, 8)
+        elif pre_state == "PRE_EXPANSION_CONFLICT":
+            interval = min(interval, 15)
         if priority >= 80:
             interval = min(interval, 10)
         elif priority >= 60:
@@ -11139,8 +11168,583 @@ class InstitutionalRadar:
             entry["institutional_analysis_time"] = time.time()
             entry["institutional_analysis_logged"] = True
             log_execution(f"[INSTITUTION] {symbol} analysis started | score={score:.1f} status={status}", "INFO")
+
+        # The TradingView evidence engine needs deeper history (EMA200 / HTF):
+        # fetch the full evidence depth for PRE_EXPANSION only, keeping the
+        # legacy snapshot for the existing institutional intent engine.
+        df_evidence = get_ohlcv_safe(symbol, INSTITUTIONAL_OHLCV_DEPTH)
+        if df_evidence is None or not is_valid_dataframe(df_evidence):
+            df_evidence = df
+        self._evaluate_pre_expansion(symbol, entry, df_evidence, price, atr, ob)
+
         if new_state == "PRE_ENTRY_READY" and old_state != "PRE_ENTRY_READY":
             self._promote_to_queue(symbol, entry)
+
+    def _compute_tv_indicators(self, df, atr):
+        """TradingView-style indicator evidence (VWAP, ADX/DMI, ATR, EMA50/200,
+        VWMA, Chandelier, SMC/SFP/MSS, HTF trend, strong candle). Reused as the
+        mathematical reference for the PRE_EXPANSION evidence engine. Defensive:
+        returns neutral when there is insufficient data (indicators need not all
+        flip on the same candle). Signals that require deep history (EMA200,
+        HTF trend) are explicitly marked ``available: False`` when the feed is
+        too shallow instead of being silently treated as neutral/valid."""
+        neutral = {
+            "alignment": "NEUTRAL", "phase": "NEUTRAL", "tv": {},
+            "data_depth": {"bars": 0, "ema200": False, "htf": False},
+        }
+        try:
+            if df is None or not isinstance(df, pd.DataFrame) or len(df) < 2:
+                return neutral
+            close = df["close"]
+            n = len(close)
+            open_v = float(df["open"].iloc[-1]) if "open" in df.columns else float(close.iloc[-1])
+            last = float(close.iloc[-1])
+            atr_v = float(atr) if atr is not None and atr > 0 else 0.0
+            tv = {}
+
+            # VWAP (only directional with a real reclaim: price beyond VWAP AND
+            # VWAP slope confirming the move, so a flat tape stays neutral)
+            try:
+                vw = vwap_features(df)
+                vwap_val = float(vw.get("vwap", 0))
+                vw_slope = float(vw.get("slope", 0))
+                vw_above = last > vwap_val * (1 + 1e-9) and vw_slope > 0
+                vw_below = last < vwap_val * (1 - 1e-9) and vw_slope < 0
+                tv["vwap"] = {
+                    "value": vwap_val,
+                    "distance": float(vw.get("distance", 0)),
+                    "slope": vw_slope,
+                    "price_above_vwap": True if vw_above else (False if vw_below else None),
+                }
+            except Exception:
+                tv["vwap"] = {"price_above_vwap": None}
+
+            # EMA 50/200 trend stack (EMA200 requires >= 200 bars; explicitly
+            # marked unavailable below that so it is never a false "valid").
+            ema_info = {}
+            ema_info["htf_available"] = n >= 200
+            if n >= 50:
+                e50 = float(ema(close, 50).iloc[-1])
+                ema_info["ema50"] = e50
+                ema_info["price_above_50"] = last > e50
+            if n >= 200:
+                e200 = float(ema(close, 200).iloc[-1])
+                ema_info["price_above_200"] = last > e200
+                if "ema50" in ema_info:
+                    ema_info["bull"] = e50 > e200 and last > e50
+                    ema_info["bear"] = e50 < e200 and last < e50
+            tv["ema"] = ema_info
+
+            # VWMA / L&L trend stack (tolerance for float noise)
+            vwma = {}
+            if len(close) >= 20:
+                vw = (close * df["volume"]).rolling(20).sum() / (
+                    df["volume"].rolling(20).sum() + 1e-9)
+                vwma_last = float(vw.iloc[-1])
+                tol = abs(vwma_last) * 1e-7 + 1e-9
+                vwma["value"] = vwma_last
+                vwma["bull"] = last > vwma_last + tol
+                vwma["bear"] = last < vwma_last - tol
+            tv["vwma"] = vwma
+
+            # ADX / DMI direction (numbers come from the shared compute_adx helper so
+            # the evidence layer cannot drift from the rest of the engine).
+            dmi = {}
+            if n >= 40:
+                try:
+                    adx_series, pdi_series, mdi_series = compute_adx(df, return_di=True)
+                    pdi_l = float(pdi_series.iloc[-1])
+                    mdi_l = float(mdi_series.iloc[-1])
+                    adx = float(adx_series.iloc[-1])
+                    dmi = {"adx": adx, "pdi": pdi_l, "mdi": mdi_l}
+                    dmi["bull"] = pdi_l > mdi_l and adx >= 20
+                    dmi["bear"] = mdi_l > pdi_l and adx >= 20
+                except Exception:
+                    dmi = {}
+            tv["dmi"] = dmi
+
+            # Chandelier direction (20, ATR*3) — exclusive: only counts when
+            # price is beyond its stop AND moving in that direction (flat tape
+            # yields neutral because both conditions cannot hold at once).
+            chand = {}
+            if len(df) >= 20 and atr_v > 0:
+                hh = float(df["high"].rolling(20).max().iloc[-1])
+                ll = float(df["low"].rolling(20).min().iloc[-1])
+                prev_cl = df["close"].shift(1)
+                prev_val = float(prev_cl.iloc[-1]) if pd.notna(prev_cl.iloc[-1]) else last
+                chand["bull"] = last > (hh - 3.0 * atr_v) and last > prev_val
+                chand["bear"] = last < (ll + 3.0 * atr_v) and last < prev_val
+            tv["chandelier"] = chand
+
+            # SFP / SMC / MSS structure
+            sfp = {"bull": False, "bear": False}
+            try:
+                shift = detect_structure_shift(df)
+                bos_up, bos_down = detect_bos(df)
+                sfp["bull"] = shift == "bullish_shift" or bool(bos_up)
+                sfp["bear"] = shift == "bearish_shift" or bool(bos_down)
+            except Exception:
+                pass
+            tv["sfp"] = sfp
+
+            # HTF trend proxy (EMA200 slope + price location; needs >= 210 bars so the
+            # slope has a 21-bar window on top of the 200-bar EMA. Marked
+            # unavailable when the live feed is too shallow — never a false
+            # "valid" signal).
+            htf = {"bull": False, "bear": False, "available": n >= 210}
+            if n >= 210:
+                e200s = ema(close, 200)
+                slope = float(e200s.iloc[-1] - e200s.iloc[-21])
+                htf["bull"] = slope > 0 and last > float(e200s.iloc[-1])
+                htf["bear"] = slope < 0 and last < float(e200s.iloc[-1])
+            tv["htf"] = htf
+
+            # Body expansion (strong candle) vs ATR + volume
+            body_ratio = (abs(last - open_v) / atr_v) if atr_v > 0 else 0.0
+            tv["body"] = {
+                "body_ratio": body_ratio,
+                "bull": body_ratio > 0.5 and last > open_v,
+                "bear": body_ratio > 0.5 and last < open_v,
+            }
+
+            # Build directional alignment from the indicator set
+            bull = tv.get("vwap", {}).get("price_above_vwap") is True
+            bear_ = tv.get("vwap", {}).get("price_above_vwap") is False
+            b = set()
+            s = set()
+            if bull: b.add("VWAP")
+            if bear_: s.add("VWAP")
+            if tv.get("ema", {}).get("bull"): b.add("EMA_TREND")
+            if tv.get("ema", {}).get("bear"): s.add("EMA_TREND")
+            if tv.get("vwma", {}).get("bull"): b.add("VWMA_TREND")
+            if tv.get("vwma", {}).get("bear"): s.add("VWMA_TREND")
+            if tv.get("dmi", {}).get("bull"): b.add("ADX_DMI")
+            if tv.get("dmi", {}).get("bear"): s.add("ADX_DMI")
+            if tv.get("chandelier", {}).get("bull"): b.add("CHANDELIER")
+            if tv.get("chandelier", {}).get("bear"): s.add("CHANDELIER")
+            if tv.get("sfp", {}).get("bull"): b.add("SMC_MSS")
+            if tv.get("sfp", {}).get("bear"): s.add("SMC_MSS")
+            if tv.get("htf", {}).get("bull"): b.add("HTF_TREND")
+            if tv.get("htf", {}).get("bear"): s.add("HTF_TREND")
+            if tv.get("body", {}).get("bull"): b.add("STRONG_CANDLE")
+            if tv.get("body", {}).get("bear"): s.add("STRONG_CANDLE")
+            if b and not s:
+                alignment = "BULLISH"
+            elif s and not b:
+                alignment = "BEARISH"
+            elif b and s:
+                alignment = "CONFLICT"
+            else:
+                alignment = "NEUTRAL"
+            return {
+                "alignment": alignment,
+                "phase": "NEUTRAL",
+                "tv": tv,
+                "ipa": {"bull": sorted(b), "bear": sorted(s)},
+                "price": last,
+                "body_ratio": body_ratio,
+                "data_depth": {
+                    "bars": n,
+                    "ema50": n >= 50,
+                    "ema200": n >= 200,
+                    "htf": n >= 210,
+                },
+            }
+        except Exception:
+            return {"alignment": "NEUTRAL", "phase": "NEUTRAL", "tv": {},
+                    "ipa": {"bull": [], "bear": []}, "price": None, "body_ratio": 0.0,
+                    "data_depth": {"bars": 0, "ema200": False, "htf": False}}
+
+    def _classify_expansion_phase(self, tv, analysis, mom):
+        """Classify the expansion phase for an actively-promoted candidate:
+        EARLY_EXPANSION / EXPANSION / OVEREXTENDED / EXHAUSTION (else NEUTRAL /
+        BUILDING). Entry is only permitted around EARLY_EXPANSION by the
+        existing entry authority — never after OVEREXTENDED / EXHAUSTION."""
+        vol_state = analysis.get("vol_state", "neutral")
+        vol_exp = vol_state == "expansion"
+        body_ratio = tv.get("body_ratio", 0.0)
+        dmi = tv.get("tv", {}).get("dmi", {})
+        adx = float(dmi.get("adx", 0) or 0)
+        vw = tv.get("tv", {}).get("vwap", {})
+        vw_dist = abs(float(vw.get("distance", 0) or 0))
+        tb = bool(mom.get("trend_expansion", False))
+        decay = bool(mom.get("momentum_decay", False))
+        exh = float(mom.get("exhaustion_risk", 0) or 0)
+        struct_ok = float(analysis.get("struct_score", 50) or 50) >= 70
+
+        # Extreme stretch: far beyond VWAP, or an oversized body. ADX is used as
+        # trend / DMI confirmation below — not as an overextension detector.
+        overextended = vw_dist > 0.15 or body_ratio > 4.0
+        exhausted = bool(decay) or exh > 50 or vol_state == "exhaustion"
+        if exhausted:
+            return "EXHAUSTION", True
+        if overextended:
+            return "OVEREXTENDED", True
+        strong_body = body_ratio > 1.2
+        # Confirmed expansion: volume + body expansion + established structure.
+        if vol_exp and strong_body and struct_ok:
+            return "EXPANSION", False
+        # Early expansion: the BEGINNING of the move — volume or body turning
+        # over with momentum accelerating, before the structure fully confirms.
+        if (vol_exp or strong_body) and (tb or adx >= 15):
+            return "EARLY_EXPANSION", False
+        return "BUILDING", False
+
+    def _analyze_zone_and_indicators(self, entry, df, price, atr, mom):
+        """Zone-first analysis: identify the relevant zone (OB / institution /
+        S&R / FVG / imbalance) from the existing analysis artifacts (no parallel
+        scanner) and assess zone quality, volume in zone, liquidity, price
+        location, and the TradingView indicator evidence. Determines whether the
+        zone is accumulating (demand) or distributing (supply)."""
+        analysis = entry.get("analysis", {}) or {}
+        res = {
+            "zone": None, "zone_quality": 0.0, "volume_in_zone": 0.0,
+            "liquidity_around_zone": 0.0, "price_location": "NEUTRAL",
+            "zone_verdict": "NEUTRAL", "phase": "NEUTRAL", "fresh": False,
+        }
+        try:
+            if df is None or not isinstance(df, pd.DataFrame) or len(df) < 2:
+                return res
+            res["fresh"] = True
+
+            # Zone identification (reuse existing analysis, not a new scanner)
+            ob_grade = str(analysis.get("ob_grade", "NONE"))
+            zones = analysis.get("zones")
+            proximity = analysis.get("proximity", analysis.get("ob_distance", 1.0))
+            if ob_grade in ("A+", "A"):
+                res["zone"] = "OB"
+                res["zone_quality"] = 1.0 if ob_grade == "A+" else 0.85
+            elif ob_grade == "B":
+                res["zone"] = "OB"
+                res["zone_quality"] = 0.6
+            elif zones:
+                res["zone"] = "INSTITUTIONAL_ZONE"
+                res["zone_quality"] = 0.5
+            elif proximity is not None and float(proximity) < 0.01:
+                res["zone"] = "S_R"
+                res["zone_quality"] = 0.5
+
+            # Volume / liquidity / price location around the zone
+            vol_state = analysis.get("vol_state", "neutral")
+            liq_score = float(analysis.get("liq_score", 50) or 50)
+            res["volume_in_zone"] = (
+                1.0 if vol_state == "expansion"
+                else 0.5 if vol_state == "normal"
+                else 0.0)
+            res["liquidity_around_zone"] = min(1.0, liq_score / 100.0)
+            res["price_location"] = analysis.get("price_location", "MID")
+
+            tv_res = self._compute_tv_indicators(df, atr)
+            res["tv"] = tv_res.get("tv", {})
+            res["ipa"] = tv_res.get("ipa", {"bull": [], "bear": []})
+            res["alignment"] = tv_res.get("alignment", "NEUTRAL")
+            res["body_ratio"] = tv_res.get("body_ratio", 0.0)
+
+            # Zone verdict: accumulation (demand) vs distribution (supply) using
+            # zone credibility + liquidity + volume + price response, NOT plain
+            # candle volume alone.
+            res["phase"], _over = self._classify_expansion_phase(tv_res, analysis, mom)
+            res["data_depth"] = tv_res.get("data_depth", {})
+            return res
+        except Exception:
+            return res
+
+    def _zone_verdict(self, zone_res, bull, bear):
+        """Combine zone quality, liquidity, volume-pressure and directional
+        evidence into ACCUMULATION / DISTRIBUTION / NEUTRAL. Volume is only
+        volume-pressure evidence; structure/liquidity/price-response decide."""
+        zq = zone_res.get("zone_quality", 0.0)
+        liq = zone_res.get("liquidity_around_zone", 0.0)
+        volz = zone_res.get("volume_in_zone", 0.0)
+        net = len(bull) - len(bear)
+        credible = zq >= 0.5 and liq >= 0.5
+        if net > 0 and credible:
+            return "ACCUMULATION"
+        if net < 0 and credible:
+            return "DISTRIBUTION"
+        return "NEUTRAL"
+
+    def _evaluate_pre_expansion(self, symbol, entry, df, price, atr, ob):
+        """Evidence-driven PRE_EXPANSION promotion for early institutional
+        candidates (TradingView / PRE-EXPANSION evidence engine).
+
+        When a Watchlist asset first appears as MEDIUM with meaningful
+        institutional evidence (OB/Zone, MSS/BOS/CHoCH, FVG, imbalance,
+        displacement, rejection, shock/boost), it is promoted IMMEDIATELY to
+        PRIORITY INSTITUTIONAL ZONE ANALYSIS through the existing radar, WITHOUT
+        waiting for STRONG or the major expansion candle. MEDIUM is the trigger
+        to START watching the setup, never an entry. Promotion only marks the
+        candidate for faster institutional re-analysis, records zone-first +
+        indicator evidence, classifies the expansion phase (EARLY_EXPANSION /
+        EXPANSION / OVEREXTENDED / EXHAUSTION) and preserves a directional
+        hypothesis (PRE_EXPANSION_LONG / PRE_EXPANSION_SHORT /
+        PRE_EXPANSION_CONFLICT). The existing institutional entry authority
+        remains the sole decision maker for actual execution.
+        """
+        analysis = entry.get("analysis", {}) or {}
+        reasons = entry.get("reasons", []) or []
+        side = str(entry.get("side", "BUY")).upper()
+        strength = entry.get("strength", "WEAK")
+        state_name = entry.get("state", "")
+
+        # Momentum flow (used for shock/boost AND expansion phase).
+        mom = {}
+        try:
+            mom = MomentumFlowEngine.analyze_momentum_flow(df)
+        except Exception:
+            mom = {}
+
+        # ---- Zone-first + TradingView indicator evidence --------------------
+        zone_res = self._analyze_zone_and_indicators(entry, df, price, atr, mom)
+        tv_bull = zone_res.get("ipa", {}).get("bull", [])
+        tv_bear = zone_res.get("ipa", {}).get("bear", [])
+
+        # ---- Gather directional institutional evidence ----------------------
+        bull = set()
+        bear = set()
+
+        # Indicators (TradingView evidence engine)
+        bull.update(tv_bull)
+        bear.update(tv_bear)
+
+        # Displacement (directional)
+        disp = analysis.get("displacement", False)
+        if disp and side == "BUY":
+            bull.add("DISPLACEMENT")
+        if disp and side == "SELL":
+            bear.add("DISPLACEMENT")
+
+        # Rejection (directional pinbar)
+        rej = analysis.get("rejection", False)
+        if rej and side == "BUY":
+            bull.add("REJECTION")
+        if rej and side == "SELL":
+            bear.add("REJECTION")
+
+        # BOS / structure shift (up = LONG evidence, down = SHORT evidence)
+        bos_up, bos_down = False, False
+        try:
+            bos_up, bos_down = detect_bos(df)
+        except Exception:
+            pass
+        struct_score = analysis.get("struct_score", 50)
+        if bos_up or (struct_score >= 70 and side == "BUY"):
+            bull.add("BOS")
+        if bos_down or (struct_score >= 70 and side == "SELL"):
+            bear.add("BOS")
+
+        # FVG / imbalance (directional, from analysis or narrative)
+        fvg = bool(analysis.get("fvg", False)) or "FVG" in reasons
+        if fvg:
+            if side == "BUY":
+                bull.add("FVG")
+            else:
+                bear.add("FVG")
+        imbalance = bool(analysis.get("imbalance", False)) or "Imbalance" in reasons
+        if imbalance:
+            if side == "BUY":
+                bull.add("IMBALANCE")
+            else:
+                bear.add("IMBALANCE")
+        # MSB / MSS narrative
+        if any(k in reasons for k in ("MSB", "MSS")):
+            if side == "BUY":
+                bull.add("MSB_MSS")
+            else:
+                bear.add("MSB_MSS")
+
+        # Liquidity sweep evidence (liq_score high => sweep taken on entry side)
+        liq_score = analysis.get("liq_score", 50)
+        if liq_score >= 70 and side == "BUY":
+            bull.add("SWEEP")
+        if liq_score >= 70 and side == "SELL":
+            bear.add("SWEEP")
+
+        # OB / zone quality + retest (zone/quality prioritized once promoted)
+        ob_grade = analysis.get("ob_grade", "NONE")
+        if ob_grade in ("A+", "A") and zone_res.get("zone_quality", 0) >= 0.5:
+            if side == "BUY":
+                bull.add("OB_ZONE")
+            else:
+                bear.add("OB_ZONE")
+
+        # Volume expansion (supporting, direction-agnostic -> adds to entry side)
+        vol_state = analysis.get("vol_state", "neutral")
+        vol_shock = vol_state == "expansion"
+
+        # RORO / institutional flow signal (directional)
+        roro = analysis.get("roro_signal", False)
+        if roro:
+            if side == "BUY":
+                bull.add("RO_RO_INSTITUTIONAL_FLOW")
+            else:
+                bear.add("RO_RO_INSTITUTIONAL_FLOW")
+
+        # Smart money bias / momentum flow
+        smb = str(entry.get("smart_money_bias", "NEUTRAL")).upper()
+        if smb in ("LONG", "BULLISH"):
+            bull.add("SMART_MONEY")
+        elif smb in ("SHORT", "BEARISH"):
+            bear.add("SMART_MONEY")
+
+        mom_exp = bool(mom.get("trend_expansion", False))
+        continuation = float(mom.get("continuation_strength", 0) or 0)
+        exhaustion = float(mom.get("exhaustion_risk", 0) or 0)
+
+        # Shock / Boost: strong displacement body + volume expansion + momentum.
+        shock_boost = False
+        flow_bias = str(mom.get("flow_bias", "NEUTRAL")).upper()
+        shock_boost = bool(mom.get("trend_expansion", False)) and vol_shock
+        if flow_bias == "BUY":
+            bull.add("MOMENTUM_ACCELERATION")
+        elif flow_bias == "SELL":
+            bear.add("MOMENTUM_ACCELERATION")
+        if mom_exp:
+            if side == "BUY":
+                bull.add("BOOST")
+            else:
+                bear.add("BOOST")
+        if shock_boost and side == "BUY":
+            bull.add("SHOCK")
+        if shock_boost and side == "SELL":
+            bear.add("SHOCK")
+
+        # Narrative reasons (already stored in watchlist entry)
+        if "Sweep" in reasons and side == "BUY":
+            bull.add("SWEEP")
+        if "Sweep" in reasons and side == "SELL":
+            bear.add("SWEEP")
+        if "CHoCH/BOS" in reasons:
+            if side == "BUY":
+                bull.add("CHOCH_BOS")
+            else:
+                bear.add("CHOCH_BOS")
+        if "ZONE_RETEST" in reasons and side == "BUY":
+            bull.add("OB_RETEST")
+        if "ZONE_RETEST" in reasons and side == "SELL":
+            bear.add("OB_RETEST")
+        if "Displacement" in reasons and side == "BUY":
+            bull.add("DISPLACEMENT")
+        if "Displacement" in reasons and side == "SELL":
+            bear.add("DISPLACEMENT")
+
+        # ---- Zone verdict: accumulation vs distribution ---------------------
+        zone_verdict = self._zone_verdict(zone_res, bull, bear)
+        zone_res["zone_verdict"] = zone_verdict
+
+        # ---- Directional hypothesis --------------------------------------
+        confidence = min(100.0, 20.0 + len(bull) * 12 + len(bear) * 12 + (10 if vol_shock else 0))
+        if bull and not bear:
+            hypothesis = "PRE_EXPANSION_LONG"
+        elif bear and not bull:
+            hypothesis = "PRE_EXPANSION_SHORT"
+        elif bull and bear:
+            hypothesis = "PRE_EXPANSION_CONFLICT"
+        else:
+            hypothesis = None
+        evidence_reasons = sorted(bull | bear)
+        ev_count = len(bull) + len(bear)
+
+        # ---- Invalidation signal -----------------------------------------
+        invalidated = False
+        invalid_reason = None
+        trap_risk = analysis.get("trap_risk", 0)
+        # Invalidation uses the FRESH momentum/exhaustion computed this tick,
+        # never the values frozen at watchlist-entry creation.
+        momentum_decay = bool(mom.get("momentum_decay", False))
+        if trap_risk > 70:
+            invalidated = True
+            invalid_reason = "TRAP_RISK"
+        elif exhaustion > 50:
+            invalidated = True
+            invalid_reason = "MOMENTUM_COLLAPSE"
+        elif momentum_decay and ev_count == 0:
+            invalidated = True
+            invalid_reason = "MOMENTUM_COLLAPSE"
+
+        prev = entry.get("pre_expansion_state")
+        now = time.time()
+
+        # ---- Apply state transitions --------------------------------------
+        if invalidated and prev:
+            entry.pop("pre_expansion_state", None)
+            if "pre_expansion" in entry:
+                entry["pre_expansion"]["phase"] = "INVALIDATED"
+            entry["pre_expansion_invalidated_time"] = now
+            log_execution(
+                f"[PRE_EXPANSION] {symbol} demoted: reason={invalid_reason}",
+                "WARN",
+            )
+            return
+
+        promoted = False
+        if hypothesis and strength in ("MEDIUM", "STRONG"):
+            # Promote when there is meaningful early institutional evidence,
+            # regardless of MEDIUM/STRONG. MEDIUM is the classic early-warning
+            # trigger this feature exists to surface; STRONG passes through
+            # unchanged (it already enters via the existing authority).
+            if ev_count >= 2 or (vol_shock and ev_count >= 1):
+                if prev != hypothesis:
+                    entry["pre_expansion_state"] = hypothesis
+                    entry["pre_expansion_evidence"] = evidence_reasons
+                    entry["pre_expansion_time"] = now
+                    entry["pre_expansion_confidence"] = round(confidence, 1)
+                    log_execution(
+                        f"[PRE_EXPANSION] {symbol} promoted from WATCHLIST "
+                        f"reason={'+'.join(evidence_reasons)} state={strength} "
+                        f"bias={'LONG' if hypothesis.endswith('LONG') else 'SHORT' if hypothesis.endswith('SHORT') else 'CONFLICT'} "
+                        f"zone={zone_res.get('zone') or 'NONE'} "
+                        f"verdict={zone_verdict} "
+                        f"action=PRIORITY_INSTITUTIONAL_ZONE_ANALYSIS",
+                        "SUCCESS",
+                    )
+                promoted = True
+
+        if not promoted:
+            # No promotion reached: if a previous PRE_EXPANSION no longer holds
+            # and evidence dropped, demote back to normal watchlist monitoring.
+            if prev and not invalidated:
+                if hypothesis is None or ev_count < 1:
+                    entry.pop("pre_expansion_state", None)
+                    log_execution(
+                        f"[PRE_EXPANSION] {symbol} no longer priority (evidence dropped)",
+                        "INFO",
+                    )
+                    return
+
+        # ---- Persist rich zone + indicator + phase snapshot ---------------
+        if zone_res.get("fresh"):
+            rich = entry.setdefault("pre_expansion", {})
+            phase = zone_res.get("phase", "NEUTRAL")
+            # Timestamps: pre_expansion < early_expansion < strong/expansion.
+            if phase == "EARLY_EXPANSION" and not rich.get("early_expansion_time"):
+                rich["early_expansion_time"] = now
+            if phase == "EXPANSION" and not rich.get("expansion_time"):
+                rich["expansion_time"] = now
+            rich["phase"] = phase
+            rich["zone"] = zone_res.get("zone")
+            rich["zone_quality"] = zone_res.get("zone_quality", 0.0)
+            rich["volume_in_zone"] = zone_res.get("volume_in_zone", 0.0)
+            rich["liquidity_around_zone"] = zone_res.get("liquidity_around_zone", 0.0)
+            rich["price_location"] = zone_res.get("price_location", "MID")
+            rich["zone_verdict"] = zone_verdict
+            rich["indicator_alignment"] = zone_res.get("alignment", "NEUTRAL")
+            rich["body_ratio"] = zone_res.get("body_ratio", 0.0)
+            rich["tv"] = zone_res.get("tv", {})
+            rich["data_depth"] = zone_res.get("data_depth", {})
+            rich["hypothesis"] = hypothesis
+            rich["updated_at"] = now
+
+            # Indicator transition memory (remember previous states).
+            hist = entry.setdefault("indicator_history", [])
+            hist.append({
+                "time": now,
+                "phase": phase,
+                "alignment": zone_res.get("alignment", "NEUTRAL"),
+                "zone": zone_res.get("zone"),
+            })
+            if len(hist) > 20:
+                entry["indicator_history"] = hist[-20:]
 
     def _calculate_acceleration(self, history):
         if len(history) < 3:
