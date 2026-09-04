@@ -3165,6 +3165,24 @@ def verify_order_filled(symbol, order_id, side, expected_qty, timeout=10):
 # ========== FIXED: close_partial with robust verification ==========
 _reconciliation_pending = False
 
+
+def _hedge_position_side(direction):
+    """Derive the BingX hedge-mode PositionSide from the POSITION direction.
+
+    The account runs in Hedge Mode, which requires PositionSide to be LONG or
+    SHORT (never BOTH). This maps the bot's internal position direction
+    (BUY=long, SELL=short; also accepts buy/sell/LONG/SHORT/long/short) to the
+    exchange's hedge-mode value. PositionSide always reflects the position being
+    opened or closed, not the order side.
+    """
+    d = str(direction).upper()
+    if d in ("BUY", "LONG"):
+        return "LONG"
+    if d in ("SELL", "SHORT"):
+        return "SHORT"
+    raise ValueError(f"cannot derive hedge positionSide from direction: {direction!r}")
+
+
 def close_partial(ratio):
     global _closing_in_progress, _reconciliation_pending
     if _closing_in_progress:
@@ -3193,7 +3211,7 @@ def close_partial(ratio):
         side = "sell" if STATE["side"] == "BUY" else "buy"
         sym = normalize_symbol(symbol)
         qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
-        order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"reduceOnly": True, "positionSide": "BOTH"})
+        order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"reduceOnly": True, "positionSide": _hedge_position_side(STATE["side"])})
         if order is None:
             log_execution("[CLOSE_PARTIAL] Order creation failed (None)", "ERROR")
             return
@@ -3273,7 +3291,7 @@ def close_position_full():
         qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
 
         for attempt in range(3):
-            order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"reduceOnly": True, "positionSide": "BOTH"})
+            order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"reduceOnly": True, "positionSide": _hedge_position_side(STATE["side"])})
             if order is None:
                 log_execution(f"[CLOSE] Order creation failed (attempt {attempt+1})", "ERROR")
                 time.sleep(1)
@@ -3316,7 +3334,7 @@ def close_position_full():
 
         log_execution("[CLOSE] All close attempts failed. Attempting emergency close via position close.", "ERROR")
         try:
-            order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"reduceOnly": True, "positionSide": "BOTH"})
+            order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"reduceOnly": True, "positionSide": _hedge_position_side(STATE["side"])})
             if order:
                 time.sleep(2)
                 pos = fetch_position(symbol)
@@ -5710,7 +5728,8 @@ class OrderManager:
                     )
                 order = self.exchange.create_order(
                     sym, "market", side.lower(), amount,
-                    params={"leverage": leverage, "clientOrderId": client_order_id, "positionSide": "BOTH"}
+                    params={"leverage": leverage, "clientOrderId": client_order_id,
+                            "positionSide": _hedge_position_side(side)}
                 )
                 self._pending_orders[client_order_id] = {
                     "symbol": sym,
@@ -5858,7 +5877,7 @@ def close_position(amount, symbol):
     close_side = "sell" if side == "BUY" else "buy"
     try:
         amount = float(ex.amount_to_precision(sym, amount))
-        order = safe_api_call(ex.create_order, sym, "market", close_side, amount, params={"reduceOnly": True, "positionSide": "BOTH"})
+        order = safe_api_call(ex.create_order, sym, "market", close_side, amount, params={"reduceOnly": True, "positionSide": _hedge_position_side(side)})
         with _TRADE_LOCK:
             _ACTIVE_TRADE = False
         log_execution(f"[CLOSE] Closed {amount} {symbol} (reduceOnly)", "SUCCESS")
