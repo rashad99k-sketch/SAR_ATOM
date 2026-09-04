@@ -47,6 +47,17 @@ def run() -> None:
     print("NEWS: ENABLED" if os.getenv("NEWS_ENABLED", "true").lower() in {"1", "true", "yes", "on"} else "NEWS: DISABLED")
     print("=" * 72)
 
+    # Ensure the account runs in the bot's intended ONE-WAY position mode.
+    # All orders (open + reduceOnly close/partial/TP-SL) carry positionSide BOTH,
+    # which is only valid in one-way mode. Best-effort and non-fatal: a no-op if
+    # already one-way, and only logged (not raised) if positions are open and the
+    # switch is rejected by BingX. Paper mode never contacts the exchange.
+    if E.MODE_LIVE and hasattr(E.ex, "set_position_mode"):
+        try:
+            E.ex.set_position_mode(False)
+        except Exception as pos_mode_err:
+            E.log_execution(f"[START] set_position_mode(one-way) warning: {pos_mode_err}", "WARN")
+
     threading.Thread(target=R.keep_alive, daemon=True, name="keep_alive").start()
     threading.Thread(target=R.safe_main_loop, args=(DASHBOARD_APP,), daemon=True,
                      name="portfolio_supervisor").start()
