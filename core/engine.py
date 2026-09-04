@@ -71,6 +71,7 @@ import traceback
 import math
 import gc
 import random
+import hashlib
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple, Optional, Any
 from enum import Enum
@@ -5689,7 +5690,9 @@ class OrderManager:
         self._seen_ids = set()
 
     def _generate_client_id(self, symbol, side):
-        return f"{symbol}_{side}_{int(time.time()*1000)}_{random.randint(1000,9999)}"
+        sym = normalize_symbol(symbol)
+        token = hashlib.md5(sym.encode("utf-8")).hexdigest()[:8]
+        return f"{token}_{side}_{int(time.time()*1000)}_{random.randint(1000,9999)}"
 
     def submit_order(self, symbol, side, amount, leverage, client_order_id=None):
         with self._lock:
@@ -5701,6 +5704,10 @@ class OrderManager:
 
             sym = normalize_symbol(symbol)
             try:
+                if len(client_order_id) > 40:
+                    raise ValueError(
+                        f"clientOrderId exceeds BingX 40-char limit: {len(client_order_id)} chars"
+                    )
                 order = self.exchange.create_order(
                     sym, "market", side.lower(), amount,
                     params={"leverage": leverage, "clientOrderId": client_order_id}
