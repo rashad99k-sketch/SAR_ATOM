@@ -5802,6 +5802,29 @@ class OrderManager:
                 return data.get("status", "UNKNOWN")
             return "UNKNOWN"
 
+    def mark_recovered(self, client_order_id, order):
+        """After a confirm TIMEOUT, reconciliation with the exchange proved the
+        original order actually executed. Reconcile the local order book to
+        FILLED so the filled position is never left as UNKNOWN/FAILED locally."""
+        with self._lock:
+            data = self._pending_orders.get(client_order_id)
+            filled = float(order.get("filled", 0.0) or 0.0)
+            if data:
+                data["status"] = "FILLED"
+                data["order"] = order
+                data["filled"] = filled
+                data["recovered"] = True
+            else:
+                self._pending_orders[client_order_id] = {
+                    "symbol": normalize_symbol(order.get("symbol", "")),
+                    "order": order,
+                    "status": "FILLED",
+                    "attempts": 0,
+                    "filled": filled,
+                    "timestamp": time.time(),
+                    "recovered": True,
+                }
+
     def is_duplicate(self, client_order_id):
         return client_order_id in self._seen_ids
 
@@ -5811,6 +5834,72 @@ class OrderManager:
             self._seen_ids.clear()
 
 _order_manager = OrderManager(ex, max_retries=3, retry_delay=1.0, confirm_timeout=15.0)
+
+
+def reconcile_open_after_timeout(symbol, direction, client_order_id, retries=2):
+    """Timeout-reconciliation for an OPEN order (BingX Hedge Mode).
+
+    A create_order that may have executed but whose confirmation fetch timed out
+    must NEVER be treated as a rejection and NEVER be blindly retried. The
+    exchange's real position is the source of truth: fetch_positions is matched
+    against the requested hedge side (LONG for BUY, SHORT for SELL — NEVER BOTH
+    and never one-way forced). If a matching position with nonzero contracts
+    exists, the original order is treated as FILLED/ACCEPTED and a synthetic
+    filled-order record is returned so the caller converges into the exact same
+    post-fill lifecycle as a normally confirmed order. Returns None when no
+    matching position exists (order stays UNKNOWN; the open may only be retried
+    after reconciliation proves no fill).
+    """
+    desired = "long" if str(direction).upper() in ("BUY", "LONG") else "short"
+    sym = normalize_symbol(symbol)
+    last_err = None
+    for attempt in range(max(1, retries)):
+        try:
+            positions = None
+            if hasattr(ex, "fetch_positions"):
+                positions = safe_api_call(ex.fetch_positions, [sym])
+            if positions is None and hasattr(ex, "fetch_open_positions"):
+                positions = safe_api_call(ex.fetch_open_positions, [sym])
+            if positions:
+                for pos in positions:
+                    pos_sym = pos.get("symbol", "")
+                    if sym not in pos_sym:
+                        continue
+                    if str(pos.get("side", "")).lower() != desired:
+                        continue
+                    contracts = float(pos.get("contracts", 0) or 0)
+                    if contracts <= 0:
+                        continue
+                    entry_price = float(pos.get("entryPrice", 0) or 0)
+                    avg_price = entry_price if entry_price > 0 else 0.0
+                    leverage = float(pos.get("leverage", 0) or 0)
+                    return {
+                        "id": pos.get("positionId") or pos.get("id") or client_order_id,
+                        "clientOrderId": client_order_id,
+                        "symbol": sym,
+                        "side": str(direction).lower(),
+                        "type": "market",
+                        "status": "closed",
+                        "filled": contracts,
+                        "amount": contracts,
+                        "average": avg_price,
+                        "price": avg_price,
+                        "entryPrice": entry_price,
+                        "timestamp": int(time.time() * 1000),
+                        "leverage": leverage,
+                        "recovered": True,
+                        "positionSide": _hedge_position_side(direction),
+                    }
+            return None
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(0.5)
+    if last_err is not None:
+        log_execution(
+            f"[OPEN_RECOVERY] symbol={sym} side={direction} "
+            f"reconciliation error: {last_err}", "ERROR")
+    return None
 
 # ========== MODIFIED open_position() ==========
 def open_position(side, amount, symbol, client_order_id=None):
@@ -5861,6 +5950,38 @@ def open_position(side, amount, symbol, client_order_id=None):
             log_execution(f"[OPEN] Order filled: {side} {amount} {symbol} @ {price}", "SUCCESS")
             with _TRADE_LOCK: _ACTIVE_TRADE = False
             return filled_order
+        elif status == "TIMEOUT":
+            # The venue may still have executed the order: the confirm fetch
+            # timed out, so the order outcome is UNKNOWN (never assume a
+            # rejection). Reconcile against the real exchange position BEFORE any
+            # retry is even considered, and adopt the real position if it exists.
+            log_execution(
+                f"[OPEN_RECOVERY] symbol={symbol} side={side} status=UNKNOWN "
+                f"(confirm TIMEOUT) - reconciling with BingX, no blind retry",
+                "WARN")
+            recovered = reconcile_open_after_timeout(symbol, side, cid)
+            if recovered is not None:
+                _order_manager.mark_recovered(cid, recovered)
+                log_execution(
+                    f"[OPEN_RECOVERY] symbol={symbol} side={side} "
+                    f"status=FILLED_AFTER_TIMEOUT qty={recovered['filled']} "
+                    f"entry={recovered['average']} order_id={recovered['id']}",
+                    "SUCCESS")
+                log_execution(
+                    f"[POSITION_ADOPTED] symbol={symbol} side={side} "
+                    f"qty={recovered['filled']} entry={recovered['average']}",
+                    "SUCCESS")
+                with _TRADE_LOCK:
+                    _ACTIVE_TRADE = False
+                return recovered
+            log_execution(
+                f"[OPEN_RECOVERY] symbol={symbol} side={side} status=NOT_FILLED - "
+                f"no matching position on BingX, order left unresolved (an open may "
+                f"only be tried again after reconciliation proves no fill)",
+                "WARN")
+            with _TRADE_LOCK:
+                _ACTIVE_TRADE = False
+            return None
         elif status in ("PARTIALLY_FILLED", "PENDING"):
             log_execution(f"[OPEN] Partial fill or still pending: {status}", "WARN")
             with _TRADE_LOCK: _ACTIVE_TRADE = False
@@ -6800,6 +6921,11 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         STATE["dynamic_manager"] = DynamicTradeManager(
             symbol, side, price, qty, atr_local, sl, tp1, tp2
         )
+        if order.get("recovered"):
+            # Order TIMEOUT -> exchange position adopted -> management now on.
+            log_execution(
+                f"[TRADE_MANAGEMENT] symbol={symbol} side={side} "
+                f"status=ACTIVE management_initialized=true", "SUCCESS")
         update_position_dashboard(symbol, side, price, qty)
         log_execution(f"LIVE {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
         tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
